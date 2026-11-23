@@ -13,7 +13,7 @@ interface LayoutProps {
 
 const NAV_ITEMS: { id: NavTab; label: string; icon: typeof Library; ready: boolean }[] = [
   { id: "bookcases", label: "Estanterías", icon: LayoutGrid, ready: true },
-  { id: "scan", label: "Escanear", icon: Camera, ready: false },
+  { id: "scan", label: "Escanear", icon: Camera, ready: true },
   { id: "inventory", label: "Inventario", icon: BookOpen, ready: false },
   { id: "organize", label: "Organizar", icon: Sparkles, ready: false },
 ];

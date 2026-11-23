@@ -3,10 +3,12 @@ import { api } from "./api/client";
 import { Layout, type NavTab } from "./components/Layout";
 import { BookcasesPage } from "./pages/BookcasesPage";
 import { ComingSoonPage } from "./pages/ComingSoonPage";
-import type { Bookcase, ConfigStatus } from "./types/library";
+import { ScanPage } from "./pages/ScanPage";
+import type { Bookcase, ConfigStatus, Shelf } from "./types/library";
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<NavTab>("bookcases");
+  const [scanTargetShelfId, setScanTargetShelfId] = useState<number | null>(null);
   const [bookcases, setBookcases] = useState<Bookcase[]>([]);
   const [configStatus, setConfigStatus] = useState<ConfigStatus | null>(null);
   const [loading, setLoading] = useState(true);
@@ -38,6 +40,11 @@ export default function App() {
       });
   }, [loadBookcases]);
 
+  const handleScanShelf = (shelf: Shelf) => {
+    setScanTargetShelfId(shelf.id);
+    setActiveTab("scan");
+  };
+
   return (
     <Layout
       activeTab={activeTab}
@@ -50,6 +57,15 @@ export default function App() {
           loading={loading}
           error={error}
           onRefresh={loadBookcases}
+          onScanShelf={handleScanShelf}
+        />
+      ) : activeTab === "scan" ? (
+        <ScanPage
+          bookcases={bookcases}
+          configStatus={configStatus}
+          initialShelfId={scanTargetShelfId}
+          onBookcasesChanged={loadBookcases}
+          onGoToBookcases={() => setActiveTab("bookcases")}
         />
       ) : (
         <ComingSoonPage tab={activeTab} />

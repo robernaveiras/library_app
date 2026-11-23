@@ -1,21 +1,14 @@
-import { BookOpen, Camera, Sparkles } from "lucide-react";
+import { BookOpen, Sparkles } from "lucide-react";
 import type { NavTab } from "../components/Layout";
 
 interface ComingSoonPageProps {
-  tab: Exclude<NavTab, "bookcases">;
+  tab: Exclude<NavTab, "bookcases" | "scan">;
 }
 
 const INFO: Record<
-  Exclude<NavTab, "bookcases">,
-  { title: string; milestone: string; description: string; icon: typeof Camera }
+  Exclude<NavTab, "bookcases" | "scan">,
+  { title: string; milestone: string; description: string; icon: typeof BookOpen }
 > = {
-  scan: {
-    title: "Escanear baldas e ISBN",
-    milestone: "Hito 2",
-    description:
-      "Haz fotos de cada balda desde el móvil, detecta libros con Gemini o Qwen en Strata, revisa rápidamente los lomos dudosos y apóyate en el escáner ISBN.",
-    icon: Camera,
-  },
   inventory: {
     title: "Inventario y categorías dinámicas",
     milestone: "Hitos 3 y 4",

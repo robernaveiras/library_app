@@ -1,6 +1,7 @@
 import {
   ArrowDown,
   ArrowUp,
+  Camera,
   MapPin,
   Pencil,
   Plus,
@@ -17,6 +18,7 @@ interface BookcaseCardProps {
   onEditShelf: (bookcase: Bookcase, shelf: Shelf) => void;
   onDeleteShelf: (shelf: Shelf) => void;
   onMoveShelf: (bookcase: Bookcase, shelfIndex: number, direction: -1 | 1) => void;
+  onScanShelf: (shelf: Shelf) => void;
 }
 
 export function BookcaseCard({
@@ -27,6 +29,7 @@ export function BookcaseCard({
   onEditShelf,
   onDeleteShelf,
   onMoveShelf,
+  onScanShelf,
 }: BookcaseCardProps) {
   const maxWidth = Math.max(...bookcase.shelves.map((s) => s.width_cm), 1);
 
@@ -128,6 +131,15 @@ export function BookcaseCard({
 
                       {/* Shelf actions */}
                       <div className="flex items-center gap-0.5 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => onScanShelf(shelf)}
+                          title="Escanear esta balda con foto"
+                          className="inline-flex items-center gap-1 rounded-md bg-amber-50 border border-amber-200/80 px-2 py-1 text-[11px] font-medium text-amber-900 hover:bg-amber-100 mr-1 cursor-pointer"
+                        >
+                          <Camera className="h-3 w-3" />
+                          <span className="hidden sm:inline">Escanear</span>
+                        </button>
                         <button
                           type="button"
                           disabled={index === 0}

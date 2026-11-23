@@ -7,7 +7,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.database import init_db
-from app.routers import bookcases, health
+from app.routers import bookcases, health, scans
 
 
 @asynccontextmanager
@@ -34,6 +34,7 @@ app.add_middleware(
 
 app.include_router(health.router)
 app.include_router(bookcases.router)
+app.include_router(scans.router)
 
 # Serve built frontend in production / single-port local mode
 if settings.frontend_dist_dir.exists():

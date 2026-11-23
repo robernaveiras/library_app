@@ -18,9 +18,16 @@ interface BookcasesPageProps {
   loading: boolean;
   error: string | null;
   onRefresh: () => Promise<void>;
+  onScanShelf: (shelf: Shelf) => void;
 }
 
-export function BookcasesPage({ bookcases, loading, error, onRefresh }: BookcasesPageProps) {
+export function BookcasesPage({
+  bookcases,
+  loading,
+  error,
+  onRefresh,
+  onScanShelf,
+}: BookcasesPageProps) {
   const [bookcaseModalOpen, setBookcaseModalOpen] = useState(false);
   const [editingBookcase, setEditingBookcase] = useState<Bookcase | null>(null);
 
@@ -226,6 +233,7 @@ export function BookcasesPage({ bookcases, loading, error, onRefresh }: Bookcase
               }
               onDeleteShelf={handleDeleteShelf}
               onMoveShelf={handleMoveShelf}
+              onScanShelf={onScanShelf}
             />
           ))}
         </div>
