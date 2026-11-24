@@ -10,6 +10,10 @@ export default defineConfig({
     VitePWA({
       registerType: "autoUpdate",
       includeAssets: ["icon.svg"],
+      workbox: {
+        navigateFallback: "index.html",
+        navigateFallbackDenylist: [/^\/api\//],
+      },
       manifest: {
         name: "Mi Biblioteca",
         short_name: "Biblioteca",

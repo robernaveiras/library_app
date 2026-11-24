@@ -11,20 +11,24 @@ import {
   Trash2,
 } from "lucide-react";
 import { api } from "../api/client";
+import { AIModelSelector } from "../components/AIModelSelector";
 import { ScanReviewView } from "../components/ScanReviewView";
+import { useTasks } from "../context/TaskContext";
 import type {
+  AISelection,
   Bookcase,
   ConfigStatus,
   ConfirmScanBookItem,
   Shelf,
   ShelfBook,
-  ShelfScan,
   ShelfScanSummary,
 } from "../types/library";
 
 interface ScanPageProps {
   bookcases: Bookcase[];
   configStatus: ConfigStatus | null;
+  aiSelection: AISelection;
+  onAiSelectionChange: (next: AISelection) => void;
   initialShelfId: number | null;
   onBookcasesChanged: () => Promise<void>;
   onGoToBookcases: () => void;
@@ -33,6 +37,8 @@ interface ScanPageProps {
 export function ScanPage({
   bookcases,
   configStatus,
+  aiSelection,
+  onAiSelectionChange,
   initialShelfId,
   onBookcasesChanged,
   onGoToBookcases,
@@ -69,35 +75,33 @@ export function ScanPage({
     [allShelves, selectedShelfId]
   );
 
-  // Provider selection
-  const [selectedProvider, setSelectedProvider] = useState<string>("gemini");
-  useEffect(() => {
-    if (!configStatus) return;
-    const configured = configStatus.providers.filter((p) => p.configured);
-    const defaultMatch = configured.find((p) => p.id === configStatus.default_provider);
-    if (defaultMatch) {
-      setSelectedProvider(defaultMatch.id);
-    } else if (configured.length > 0) {
-      setSelectedProvider(configured[0].id);
-    } else {
-      setSelectedProvider(configStatus.default_provider || "gemini");
-    }
-  }, [configStatus]);
+  const {
+    dataVersion,
+    isTaskRunning,
+    pendingScan: activeScan,
+    setPendingScan: setActiveScan,
+    runTask,
+  } = useTasks();
 
   // Selected image file & preview
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [analyzing, setAnalyzing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successBanner, setSuccessBanner] = useState<string | null>(null);
 
-  // Active scan under review
-  const [activeScan, setActiveScan] = useState<ShelfScan | null>(null);
+  const analyzing = isTaskRunning("scan:");
 
   // History & current books on selected shelf
   const [recentScans, setRecentScans] = useState<ShelfScanSummary[]>([]);
   const [shelfBooks, setShelfBooks] = useState<ShelfBook[]>([]);
   const [loadingShelfDetails, setLoadingShelfDetails] = useState(false);
+
+  // If a pending scan exists for another shelf, sync selectedShelfId so review view matches
+  useEffect(() => {
+    if (activeScan && activeScan.shelf_id !== selectedShelfId) {
+      setSelectedShelfId(activeScan.shelf_id);
+    }
+  }, [activeScan, selectedShelfId]);
 
   useEffect(() => {
     return () => {
@@ -128,7 +132,7 @@ export function ScanPage({
       setRecentScans([]);
       setShelfBooks([]);
     }
-  }, [selectedShelfId, loadShelfDetails]);
+  }, [selectedShelfId, loadShelfDetails, dataVersion]);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -143,22 +147,33 @@ export function ScanPage({
 
   const handleAnalyze = async () => {
     if (!selectedShelfId || !selectedFile) return;
+    const shelfId = selectedShelfId;
+    const fileToSend = selectedFile;
+    const shelfName = selectedPair?.shelf.label ?? `Balda ${shelfId}`;
+    const modelName = aiSelection.model || aiSelection.provider;
+
     setError(null);
     setSuccessBanner(null);
-    setAnalyzing(true);
-    try {
-      const scan = await api.uploadShelfScan(selectedShelfId, selectedFile, selectedProvider);
-      setActiveScan(scan);
-      setSelectedFile(null);
-      if (previewUrl) {
-        URL.revokeObjectURL(previewUrl);
-        setPreviewUrl(null);
-      }
-      await loadShelfDetails(selectedShelfId);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "No se pudo analizar la foto de la balda.");
-    } finally {
-      setAnalyzing(false);
+    setSelectedFile(null);
+    if (previewUrl) {
+      URL.revokeObjectURL(previewUrl);
+      setPreviewUrl(null);
+    }
+
+    const scan = await runTask({
+      key: `scan:${shelfId}`,
+      label: `Escaneando ${shelfName} con ${modelName}...`,
+      tab: "scan",
+      run: () =>
+        api.uploadShelfScan(shelfId, fileToSend, aiSelection.provider, aiSelection.model),
+      formatSuccess: (res) =>
+        `Escaneo de ${shelfName} listo (${res.candidates.length} libros detectados).`,
+      onSuccess: (res) => {
+        setActiveScan(res);
+      },
+    });
+    if (!scan) {
+      setError("El escaneo falló. Revisa el aviso superior para ver el detalle.");
     }
   };
 
@@ -310,44 +325,16 @@ export function ScanPage({
             </select>
           </div>
 
-          {/* 2. AI Provider selector */}
+          {/* 2. AI Provider & Model selector */}
           <div className="space-y-2">
             <label className="block text-sm font-semibold text-stone-800">
-              2. Modelo de visión IA
+              2. Proveedor y modelo de visión IA
             </label>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-              {providers.map((p) => {
-                const isSelected = selectedProvider === p.id;
-                return (
-                  <button
-                    key={p.id}
-                    type="button"
-                    onClick={() => setSelectedProvider(p.id)}
-                    className={`flex flex-col items-start rounded-xl border p-3 text-left transition-all cursor-pointer ${
-                      isSelected
-                        ? "border-amber-800 bg-amber-50/60 ring-2 ring-amber-800/15"
-                        : "border-stone-200 bg-white hover:border-stone-300"
-                    }`}
-                  >
-                    <div className="flex w-full items-center justify-between gap-2">
-                      <span className="text-sm font-semibold text-stone-900">{p.name}</span>
-                      <span
-                        className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
-                          p.configured
-                            ? "bg-emerald-100 text-emerald-800"
-                            : "bg-stone-100 text-stone-500"
-                        }`}
-                      >
-                        {p.configured ? "Listo" : "Sin clave"}
-                      </span>
-                    </div>
-                    <span className="mt-1 text-xs font-mono text-stone-500 truncate max-w-full">
-                      {p.model}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
+            <AIModelSelector
+              configStatus={configStatus}
+              value={aiSelection}
+              onChange={onAiSelectionChange}
+            />
           </div>
 
           {/* 3. Capture / Upload photo */}
@@ -400,7 +387,9 @@ export function ScanPage({
                   {analyzing ? (
                     <>
                       <Loader2 className="h-4 w-4 animate-spin" />
-                      <span>Analizando lomos con {selectedProvider}...</span>
+                      <span>
+                        Analizando lomos con {aiSelection.model || aiSelection.provider}...
+                      </span>
                     </>
                   ) : (
                     <>
