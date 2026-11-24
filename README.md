@@ -51,3 +51,20 @@ cd frontend && npm run build
 cd ../backend && .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 Abre `http://<IP-DE-TU-PC>:8000` desde tu PC o móvil en la misma red Wi-Fi.
+
+### Modo HTTPS con Tailscale (recomendado para cámara ISBN en vivo y PWA)
+Con Tailscale obtienes un certificado HTTPS real de confianza (`https://<tu-pc>.<tu-tailnet>.ts.net`), privado dentro de tu red Tailscale, sin avisos de seguridad en el móvil:
+
+1. Instala y conecta Tailscale en este PC (Arch / Omarchy):
+   ```bash
+   sudo pacman -S tailscale
+   sudo systemctl enable --now tailscaled
+   sudo tailscale up --operator=$USER
+   ```
+2. Activa **MagicDNS** y **HTTPS Certificates** en [login.tailscale.com/admin/dns](https://login.tailscale.com/admin/dns).
+3. Instala la app de **Tailscale** en tu móvil con la misma cuenta.
+4. Arranca la biblioteca con el script incluido:
+   ```bash
+   ./scripts/start-tailscale.sh
+   ```
+5. Abre en tu móvil la URL `https://redqueen.<tu-tailnet>.ts.net` que mostrará el script. Para desactivar el proxy HTTPS más adelante: `tailscale serve reset`.
