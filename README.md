@@ -68,3 +68,7 @@ Con Tailscale obtienes un certificado HTTPS real de confianza (`https://<tu-pc>.
    ./scripts/start-tailscale.sh
    ```
 5. Abre en tu móvil la URL `https://redqueen.<tu-tailnet>.ts.net` que mostrará el script. Para desactivar el proxy HTTPS más adelante: `tailscale serve reset`.
+
+## Licencia
+
+Este proyecto se distribuye bajo la licencia [MIT](LICENSE).
