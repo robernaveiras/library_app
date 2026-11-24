@@ -9,8 +9,13 @@ from app.database import Base, create_sqlite_engine, get_db
 from app.main import app
 from app.routers import scans as scans_router
 from app.schemas.scan import DetectedBookCandidate, IsbnLookupResult
-from app.services.ai_providers import AIProvider, ScanAnalysisResult, parse_detected_books
-from app.services.image_utils import estimate_dimensions_from_bbox
+from app.services.ai_providers import (
+    AIProvider,
+    ScanAnalysisResult,
+    _format_httpx_error,
+    parse_detected_books,
+)
+from app.services.image_utils import estimate_dimensions_from_bbox, resize_image_bytes
 
 
 class FakeAIProvider(AIProvider):
@@ -224,3 +229,45 @@ def test_isbn_lookup_endpoint(tmp_path, monkeypatch):
 
     r_404 = client.get("/api/isbn/0000000000")
     assert r_404.status_code == 404
+
+
+def test_parse_strips_think_tags_and_formats_read_timeout():
+    import httpx
+
+    raw = """<think>
+    Veo un libro con texto {algo} en el lomo.
+    </think>
+    {"books": [{"title": "El Aleph", "authors": ["Borges"], "confidence": 0.9}]}"""
+    parsed = parse_detected_books(raw)
+    assert len(parsed) == 1
+    assert parsed[0].title == "El Aleph"
+
+    msg = _format_httpx_error("Strata", "http://192.168.1.186:47832/v1", httpx.ReadTimeout(""), 300)
+    assert "ReadTimeout" in msg
+    assert "300s" in msg
+
+    big_buf = BytesIO()
+    Image.new("RGB", (2048, 1536), color=(180, 180, 180)).save(big_buf, format="JPEG")
+    resized = resize_image_bytes(big_buf.getvalue(), max_long_edge=1280)
+    assert max(Image.open(BytesIO(resized)).size) == 1280
+
+
+def test_parse_recovers_trailing_commas_and_truncated_json():
+    dirty = """Aquí tienes los libros:
+    {
+      "books": [
+        {"title": "Dune", "authors": ["Frank Herbert"], "confidence": 0.95,},
+        {"title": "Solaris", "authors": ["Stanisław Lem"], "confidence": 0.88},
+      ]
+    }
+    Nota final: {espero que ayude}"""
+    parsed = parse_detected_books(dirty)
+    assert [b.title for b in parsed] == ["Dune", "Solaris"]
+
+    truncated = """{
+      "books": [
+        {"title": "Libro 1", "authors": ["Autor 1"], "confidence": 0.9},
+        {"title": "Libro 2", "authors": ["Autor 2"], "confidence": 0.8},
+        {"title": "Libro 3 cortado", "authors": ["Aut"""
+    recovered = parse_detected_books(truncated)
+    assert [b.title for b in recovered] == ["Libro 1", "Libro 2"]

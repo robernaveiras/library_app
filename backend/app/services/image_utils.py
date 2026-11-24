@@ -31,6 +31,25 @@ def process_and_save_scan_image(raw_bytes: bytes, destination: Path) -> tuple[in
         return width, height
 
 
+def resize_image_bytes(image_bytes: bytes, max_long_edge: int, quality: int = 85) -> bytes:
+    """Return JPEG bytes downscaled to max_long_edge if larger; keeps original if already smaller."""
+    if max_long_edge <= 0:
+        return image_bytes
+    with Image.open(BytesIO(image_bytes)) as img:
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        width, height = img.size
+        long_edge = max(width, height)
+        if long_edge <= max_long_edge:
+            return image_bytes
+        scale = max_long_edge / float(long_edge)
+        new_size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+        resized = img.resize(new_size, Image.Resampling.LANCZOS)
+        out = BytesIO()
+        resized.save(out, format="JPEG", quality=quality, optimize=True)
+        return out.getvalue()
+
+
 def estimate_dimensions_from_bbox(
     bbox: Optional[list[float]],
     shelf_width_cm: float,

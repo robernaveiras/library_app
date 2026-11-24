@@ -1,6 +1,8 @@
 import base64
 import json
+import logging
 import re
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -9,6 +11,9 @@ import httpx
 
 from app.config import settings
 from app.schemas.scan import DetectedBookCandidate
+from app.services.image_utils import resize_image_bytes
+
+logger = logging.getLogger(__name__)
 
 
 SHELF_SCAN_SYSTEM_PROMPT = """Eres un experto bibliotecario y analizador visual de estanterías de libros.
@@ -33,6 +38,10 @@ Reglas obligatorias:
 class AIProviderError(Exception):
     """Raised when an AI provider is misconfigured or fails to process a request."""
 
+    def __init__(self, message: str, raw_text: Optional[str] = None):
+        super().__init__(message)
+        self.raw_text = raw_text
+
 
 @dataclass
 class ScanAnalysisResult:
@@ -42,30 +51,132 @@ class ScanAnalysisResult:
     raw_text: str
 
 
+def _format_httpx_error(provider_label: str, target_url: str, exc: httpx.HTTPError, read_timeout: float) -> str:
+    err_name = type(exc).__name__
+    err_detail = str(exc).strip()
+    if isinstance(exc, httpx.ReadTimeout):
+        return (
+            f"Tiempo de espera agotado ({err_name} tras {int(read_timeout)}s) esperando respuesta "
+            f"de {provider_label} ({target_url}). El modelo tardó demasiado en procesar la imagen; "
+            f"prueba reduciendo STRATA_MAX_IMAGE_EDGE o aumentando STRATA_TIMEOUT_SECONDS."
+        )
+    if isinstance(exc, (httpx.ConnectTimeout, httpx.ConnectError)):
+        return (
+            f"No se pudo conectar con {provider_label} ({target_url}) [{err_name}"
+            f"{': ' + err_detail if err_detail else ''}]. Comprueba que el servidor esté encendido "
+            f"y accesible en esa IP y puerto."
+        )
+    return (
+        f"Error de red con {provider_label} ({target_url}) [{err_name}"
+        f"{': ' + err_detail if err_detail else ''}]."
+    )
+
+
+def _clean_json_text(text: str) -> str:
+    # Remove trailing commas before closing } or ]
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+    return text
+
+
+def _raw_decode_first_json(text: str) -> Any:
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"[\{\[]", text):
+        try:
+            obj, _end = decoder.raw_decode(text, match.start())
+            return obj
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _recover_book_objects(text: str) -> list[dict[str, Any]]:
+    """Fallback recovery: extract individually valid book JSON objects from truncated/dirty output."""
+    decoder = json.JSONDecoder()
+    recovered: list[dict[str, Any]] = []
+    idx = 0
+    length = len(text)
+    while idx < length:
+        brace = text.find("{", idx)
+        if brace == -1:
+            break
+        # Skip the outer {"books": [ wrapper by trying decode; if it fails, move past this '{'
+        try:
+            obj, end_pos = decoder.raw_decode(text, brace)
+            if isinstance(obj, dict) and ("title" in obj or "authors" in obj):
+                recovered.append(obj)
+                idx = end_pos
+                continue
+        except json.JSONDecodeError:
+            pass
+        idx = brace + 1
+    return recovered
+
+
 def _extract_json_payload(raw_text: str) -> Any:
     text = raw_text.strip()
+    # Strip <think>...</think> reasoning blocks emitted by thinking models (e.g. Qwen3)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
     # Strip markdown code fences if present
     fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
     if fence_match:
         text = fence_match.group(1).strip()
 
+    # 1. Direct parse
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # Try locating the first JSON object or array in the response
-        start_obj = text.find("{")
-        start_arr = text.find("[")
-        starts = [s for s in (start_obj, start_arr) if s != -1]
-        if not starts:
-            raise AIProviderError("La IA no devolvió un JSON válido.")
-        start = min(starts)
-        end = max(text.rfind("}"), text.rfind("]"))
-        if end <= start:
-            raise AIProviderError("La respuesta JSON de la IA está incompleta.")
+        pass
+
+    # 2. Clean common LLM JSON quirks (trailing commas) and retry
+    cleaned = _clean_json_text(text)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # 3. Decode first valid JSON object/array ignoring leading/trailing commentary
+    # Avoid returning a single inner book object when an outer "books" array was truncated/broken
+    decoded = _raw_decode_first_json(cleaned)
+    if decoded is not None:
+        looks_like_single_inner_item = (
+            isinstance(decoded, dict)
+            and "title" in decoded
+            and "books" not in decoded
+            and '"books"' in cleaned
+        )
+        if not looks_like_single_inner_item:
+            return decoded
+
+    # 4. Try strict slice between first {/[ and last }/] for a clear error message if all else fails
+    start_obj = cleaned.find("{")
+    start_arr = cleaned.find("[")
+    starts = [s for s in (start_obj, start_arr) if s != -1]
+    if not starts:
+        raise AIProviderError("La IA no devolvió un JSON válido.", raw_text=raw_text)
+    start = min(starts)
+    end = max(cleaned.rfind("}"), cleaned.rfind("]"))
+    if end > start:
         try:
-            return json.loads(text[start : end + 1])
+            return json.loads(cleaned[start : end + 1])
         except json.JSONDecodeError as exc:
-            raise AIProviderError(f"No se pudo interpretar el JSON devuelto por la IA: {exc}") from exc
+            # 5. Last resort: recover individual valid book objects from truncated/partially malformed output
+            recovered = _recover_book_objects(cleaned)
+            if recovered:
+                logger.warning(
+                    "JSON principal malformado (%s), recuperados %d libros individuales.",
+                    exc,
+                    len(recovered),
+                )
+                return {"books": recovered}
+            raise AIProviderError(
+                f"No se pudo interpretar el JSON devuelto por la IA: {exc}",
+                raw_text=raw_text,
+            ) from exc
+
+    recovered = _recover_book_objects(cleaned)
+    if recovered:
+        return {"books": recovered}
+    raise AIProviderError("La respuesta JSON de la IA está incompleta.", raw_text=raw_text)
 
 
 def _normalize_bbox(raw_bbox: Any) -> Optional[list[float]]:
@@ -226,12 +337,30 @@ class GeminiProvider(AIProvider):
         }
 
         async with httpx.AsyncClient(timeout=120.0) as client:
+            start = time.perf_counter()
+            logger.debug(
+                "[Gemini] POST %s (model=%s, image_bytes=%d, shelf=%r)",
+                url,
+                self.model,
+                len(image_bytes),
+                shelf_label,
+            )
             try:
                 resp = await client.post(url, params={"key": self.api_key}, json=body)
             except httpx.HTTPError as exc:
-                raise AIProviderError(f"Error de conexión con Gemini: {exc}") from exc
+                msg = _format_httpx_error("Gemini", url, exc, 120.0)
+                logger.warning("[Gemini] Error tras %.1fs: %s", time.perf_counter() - start, msg)
+                raise AIProviderError(msg) from exc
 
+        elapsed = time.perf_counter() - start
+        logger.debug(
+            "[Gemini] Respuesta HTTP %s en %.2fs (body_bytes=%d)",
+            resp.status_code,
+            elapsed,
+            len(resp.content),
+        )
         if resp.status_code >= 400:
+            logger.warning("[Gemini] Error HTTP %s: %s", resp.status_code, resp.text[:600])
             raise AIProviderError(f"Gemini devolvió error {resp.status_code}: {resp.text[:400]}")
 
         data = resp.json()
@@ -239,9 +368,21 @@ class GeminiProvider(AIProvider):
             parts = data["candidates"][0]["content"]["parts"]
             raw_text = "".join(p.get("text", "") for p in parts)
         except (KeyError, IndexError, TypeError) as exc:
+            logger.warning("[Gemini] Estructura inesperada: %s", str(data)[:600])
             raise AIProviderError(f"Respuesta inesperada de Gemini: {str(data)[:300]}") from exc
 
+        logger.debug(
+            "[Gemini] raw_text (%d chars): %s",
+            len(raw_text),
+            raw_text[:800].replace("\n", "\\n"),
+        )
         candidates = parse_detected_books(raw_text)
+        logger.info(
+            "[Gemini] Escaneo completado (model=%s, libros=%d, tiempo=%.2fs)",
+            self.model,
+            len(candidates),
+            elapsed,
+        )
         return ScanAnalysisResult(
             provider=self.provider_id,
             model=self.model,
@@ -260,12 +401,23 @@ class GeminiProvider(AIProvider):
             },
         }
         async with httpx.AsyncClient(timeout=120.0) as client:
+            start = time.perf_counter()
+            logger.debug(
+                "[Gemini] complete_json model=%s prompt_chars=%d",
+                self.model,
+                len(user_prompt),
+            )
             try:
                 resp = await client.post(url, params={"key": self.api_key}, json=body)
             except httpx.HTTPError as exc:
-                raise AIProviderError(f"Error de conexión con Gemini: {exc}") from exc
+                msg = _format_httpx_error("Gemini", url, exc, 120.0)
+                logger.warning("[Gemini] complete_json error: %s", msg)
+                raise AIProviderError(msg) from exc
 
+        elapsed = time.perf_counter() - start
+        logger.debug("[Gemini] complete_json HTTP %s en %.2fs", resp.status_code, elapsed)
         if resp.status_code >= 400:
+            logger.warning("[Gemini] complete_json HTTP %s: %s", resp.status_code, resp.text[:600])
             raise AIProviderError(f"Gemini devolvió error {resp.status_code}: {resp.text[:400]}")
 
         data = resp.json()
@@ -275,13 +427,28 @@ class GeminiProvider(AIProvider):
         except (KeyError, IndexError, TypeError) as exc:
             raise AIProviderError(f"Respuesta inesperada de Gemini: {str(data)[:300]}") from exc
 
+        logger.debug(
+            "[Gemini] complete_json raw (%d chars): %s",
+            len(raw_text),
+            raw_text[:600].replace("\n", "\\n"),
+        )
         return _extract_json_payload(raw_text)
 
 
 class StrataOpenAIProvider(AIProvider):
     provider_id = "strata"
 
-    def __init__(self, base_url: str, api_key: str, model: str):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout_seconds: int = 300,
+        max_image_edge: int = 1024,
+        max_tokens: int = 3072,
+        use_json_mode: bool = False,
+        enable_thinking: bool = False,
+    ):
         if not base_url.strip() or not api_key.strip():
             raise AIProviderError(
                 "STRATA_BASE_URL y STRATA_API_KEY deben estar configurados en el archivo .env."
@@ -289,6 +456,111 @@ class StrataOpenAIProvider(AIProvider):
         self.base_url = base_url.strip().rstrip("/")
         self.api_key = api_key.strip()
         self.model = model.strip()
+        self.timeout_seconds = max(30, int(timeout_seconds))
+        self.max_image_edge = int(max_image_edge)
+        self.max_tokens = max(512, int(max_tokens))
+        self.use_json_mode = bool(use_json_mode)
+        self.enable_thinking = bool(enable_thinking)
+
+    async def _stream_once(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+        start: float,
+    ) -> tuple[int, str, str]:
+        """Execute a streaming chat completion request and collect content + reasoning progress.
+
+        Returns (status_code, content_text, error_body).
+        """
+        stream_payload = {**payload, "stream": True}
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        finish_reason: Optional[str] = None
+        last_log_t = start
+
+        async with client.stream("POST", url, headers=headers, json=stream_payload) as resp:
+            if resp.status_code >= 400:
+                err_bytes = await resp.aread()
+                return resp.status_code, "", err_bytes.decode("utf-8", errors="replace")
+
+            content_type = (resp.headers.get("content-type") or "").lower()
+            # Handle servers that ignore stream=True and return regular application/json
+            if "text/event-stream" not in content_type:
+                raw_body = await resp.aread()
+                data = json.loads(raw_body.decode("utf-8", errors="replace"))
+                choice0 = (data.get("choices") or [{}])[0]
+                msg = choice0.get("message") or {}
+                content = msg.get("content") or ""
+                if isinstance(content, list):
+                    content = "".join(
+                        p.get("text", "") for p in content if isinstance(p, dict)
+                    )
+                return resp.status_code, str(content), ""
+
+            async for line in resp.aiter_lines():
+                now = time.perf_counter()
+                if now - start > self.timeout_seconds:
+                    raise httpx.ReadTimeout(
+                        f"Superado límite total de {self.timeout_seconds}s durante streaming"
+                    )
+                line = line.strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                if choices[0].get("finish_reason"):
+                    finish_reason = choices[0]["finish_reason"]
+
+                delta_content = delta.get("content")
+                if isinstance(delta_content, str) and delta_content:
+                    content_parts.append(delta_content)
+
+                delta_reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                if isinstance(delta_reasoning, str) and delta_reasoning:
+                    reasoning_parts.append(delta_reasoning)
+
+                if now - last_log_t >= 5.0:
+                    c_len = sum(len(x) for x in content_parts)
+                    r_len = sum(len(x) for x in reasoning_parts)
+                    tail = ("".join(content_parts[-8:]) or "".join(reasoning_parts[-8:]))[-100:]
+                    logger.debug(
+                        "[Strata] streaming %.1fs | content=%d chars | reasoning=%d chars | tail=%r",
+                        now - start,
+                        c_len,
+                        r_len,
+                        tail.replace("\n", "\\n"),
+                    )
+                    last_log_t = now
+
+        full_content = "".join(content_parts)
+        full_reasoning = "".join(reasoning_parts)
+        elapsed = time.perf_counter() - start
+        logger.debug(
+            "[Strata] Stream finalizado en %.2fs (finish_reason=%s, content=%d chars, reasoning=%d chars)",
+            elapsed,
+            finish_reason,
+            len(full_content),
+            len(full_reasoning),
+        )
+        final_text = full_content if full_content.strip() else full_reasoning
+        logger.debug(
+            "[Strata] preview (%d chars): %s",
+            len(final_text),
+            final_text[:1000].replace("\n", "\\n"),
+        )
+        return 200, final_text, ""
 
     async def _post_chat_completions(self, payload: dict[str, Any]) -> str:
         url = f"{self.base_url}/chat/completions"
@@ -296,35 +568,67 @@ class StrataOpenAIProvider(AIProvider):
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        async with httpx.AsyncClient(timeout=180.0) as client:
+        timeout = httpx.Timeout(
+            connect=15.0,
+            read=float(self.timeout_seconds),
+            write=30.0,
+            pool=15.0,
+        )
+        start = time.perf_counter()
+        logger.debug(
+            "[Strata] POST %s (model=%s, max_tokens=%s, json_mode=%s, thinking=%s, timeout=%ss)",
+            url,
+            self.model,
+            payload.get("max_tokens"),
+            "response_format" in payload,
+            self.enable_thinking,
+            self.timeout_seconds,
+        )
+        async with httpx.AsyncClient(timeout=timeout) as client:
             try:
-                resp = await client.post(url, headers=headers, json=payload)
-            except httpx.HTTPError as exc:
-                raise AIProviderError(f"Error de conexión con Strata ({self.base_url}): {exc}") from exc
-
-            # Graceful fallback if the OpenAI-compatible endpoint doesn't support response_format
-            if resp.status_code in (400, 422) and "response_format" in payload:
-                fallback_payload = {k: v for k, v in payload.items() if k != "response_format"}
-                try:
-                    resp = await client.post(url, headers=headers, json=fallback_payload)
-                except httpx.HTTPError as exc:
-                    raise AIProviderError(
-                        f"Error de conexión con Strata ({self.base_url}): {exc}"
-                    ) from exc
-
-        if resp.status_code >= 400:
-            raise AIProviderError(f"Strata devolvió error {resp.status_code}: {resp.text[:400]}")
-
-        data = resp.json()
-        try:
-            content = data["choices"][0]["message"]["content"]
-            if isinstance(content, list):
-                return "".join(
-                    part.get("text", "") for part in content if isinstance(part, dict)
+                status_code, raw_text, err_text = await self._stream_once(
+                    client, url, headers, payload, start
                 )
-            return str(content)
-        except (KeyError, IndexError, TypeError) as exc:
-            raise AIProviderError(f"Respuesta inesperada de Strata: {str(data)[:300]}") from exc
+            except httpx.HTTPError as exc:
+                msg = _format_httpx_error("Strata", self.base_url, exc, self.timeout_seconds)
+                logger.warning(
+                    "[Strata] Request failed tras %.2fs: %s", time.perf_counter() - start, msg
+                )
+                raise AIProviderError(msg) from exc
+
+            # Graceful fallback if server rejects optional extra keys (chat_template_kwargs / response_format)
+            if status_code in (400, 422) and (
+                "response_format" in payload or "chat_template_kwargs" in payload
+            ):
+                logger.debug(
+                    "[Strata] HTTP %s con parámetros opcionales (%s); reintentando payload estándar",
+                    status_code,
+                    err_text[:200],
+                )
+                fallback_payload = {
+                    k: v
+                    for k, v in payload.items()
+                    if k not in ("response_format", "chat_template_kwargs")
+                }
+                try:
+                    status_code, raw_text, err_text = await self._stream_once(
+                        client, url, headers, fallback_payload, start
+                    )
+                except httpx.HTTPError as exc:
+                    msg = _format_httpx_error("Strata", self.base_url, exc, self.timeout_seconds)
+                    logger.warning(
+                        "[Strata] Fallback failed tras %.2fs: %s", time.perf_counter() - start, msg
+                    )
+                    raise AIProviderError(msg) from exc
+
+        if status_code >= 400:
+            err_msg = f"Strata devolvió error {status_code}: {err_text[:400]}"
+            logger.warning("[Strata] %s", err_msg)
+            raise AIProviderError(err_msg)
+
+        if not raw_text.strip():
+            raise AIProviderError("Strata devolvió una respuesta vacía.")
+        return raw_text
 
     async def analyze_shelf_image(
         self,
@@ -334,12 +638,20 @@ class StrataOpenAIProvider(AIProvider):
         shelf_height_cm: float,
         mime_type: str = "image/jpeg",
     ) -> ScanAnalysisResult:
-        b64_image = base64.b64encode(image_bytes).decode("ascii")
+        # Downscale image for local vision models so prefill stays fast while bbox stays normalized 0..1
+        prepared_bytes = resize_image_bytes(image_bytes, max_long_edge=self.max_image_edge)
+        logger.debug(
+            "[Strata] Imagen preparada para visión: orig=%d bytes -> resized=%d bytes (max_edge=%d)",
+            len(image_bytes),
+            len(prepared_bytes),
+            self.max_image_edge,
+        )
+        b64_image = base64.b64encode(prepared_bytes).decode("ascii")
         data_url = f"data:{mime_type};base64,{b64_image}"
         payload: dict[str, Any] = {
             "model": self.model,
             "temperature": 0.1,
-            "response_format": {"type": "json_object"},
+            "max_tokens": self.max_tokens,
             "messages": [
                 {"role": "system", "content": SHELF_SCAN_SYSTEM_PROMPT},
                 {
@@ -359,8 +671,17 @@ class StrataOpenAIProvider(AIProvider):
                 },
             ],
         }
+        if self.use_json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        if not self.enable_thinking:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
         raw_text = await self._post_chat_completions(payload)
         candidates = parse_detected_books(raw_text)
+        logger.info(
+            "[Strata] Escaneo completado (model=%s, libros=%d)",
+            self.model,
+            len(candidates),
+        )
         return ScanAnalysisResult(
             provider=self.provider_id,
             model=self.model,
@@ -372,12 +693,16 @@ class StrataOpenAIProvider(AIProvider):
         payload: dict[str, Any] = {
             "model": self.model,
             "temperature": 0.2,
-            "response_format": {"type": "json_object"},
+            "max_tokens": self.max_tokens,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
         }
+        if self.use_json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        if not self.enable_thinking:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
         raw_text = await self._post_chat_completions(payload)
         return _extract_json_payload(raw_text)
 
@@ -396,5 +721,10 @@ def get_ai_provider(
             base_url=settings.strata_base_url,
             api_key=settings.strata_api_key,
             model=model_override or settings.strata_model,
+            timeout_seconds=settings.strata_timeout_seconds,
+            max_image_edge=settings.strata_max_image_edge,
+            max_tokens=settings.strata_max_tokens,
+            use_json_mode=settings.strata_use_json_mode,
+            enable_thinking=settings.strata_enable_thinking,
         )
     raise AIProviderError(f"Proveedor de IA desconocido: '{chosen}'. Usa 'gemini' o 'strata'.")

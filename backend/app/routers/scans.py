@@ -1,4 +1,5 @@
 import json
+import logging
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
@@ -26,6 +27,7 @@ from app.services.image_utils import estimate_dimensions_from_bbox, process_and_
 from app.services.isbn_lookup import lookup_isbn
 
 router = APIRouter(prefix="/api", tags=["scans"])
+logger = logging.getLogger(__name__)
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
 
@@ -131,7 +133,7 @@ async def create_shelf_scan(
     filename = f"shelf_{shelf.id}_{uuid4().hex[:12]}.jpg"
     dest_path = settings.scans_dir / filename
     try:
-        process_and_save_scan_image(raw_bytes, dest_path)
+        width_px, height_px = process_and_save_scan_image(raw_bytes, dest_path)
     except (UnidentifiedImageError, OSError) as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -139,6 +141,18 @@ async def create_shelf_scan(
         ) from exc
 
     processed_bytes = dest_path.read_bytes()
+    logger.debug(
+        "Escaneo balda %d (%s): upload=%s (%d bytes) -> %dx%d JPEG (%d bytes), provider=%s, model=%s",
+        shelf.id,
+        shelf.label,
+        file.filename,
+        len(raw_bytes),
+        width_px,
+        height_px,
+        len(processed_bytes),
+        ai.provider_id,
+        ai.model,
+    )
 
     scan = ShelfScan(
         shelf_id=shelf.id,
@@ -161,7 +175,14 @@ async def create_shelf_scan(
         )
     except AIProviderError as exc:
         scan.status = "error"
-        scan.raw_response_json = json.dumps({"error": str(exc), "candidates": []}, ensure_ascii=False)
+        scan.raw_response_json = json.dumps(
+            {
+                "error": str(exc),
+                "raw_text": (exc.raw_text or "")[:8000] if exc.raw_text else None,
+                "candidates": [],
+            },
+            ensure_ascii=False,
+        )
         db.commit()
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 

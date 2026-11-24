@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     app_host: str = "0.0.0.0"
     app_port: int = 8000
     data_dir: str = "./data"
+    log_level: str = "DEBUG"
 
     default_ai_provider: str = "gemini"
 
@@ -26,6 +27,11 @@ class Settings(BaseSettings):
     strata_base_url: str = ""
     strata_api_key: str = ""
     strata_model: str = "Qwen3.8-Flash-Next-Gyro-M"
+    strata_timeout_seconds: int = 300
+    strata_max_image_edge: int = 1024
+    strata_max_tokens: int = 3072
+    strata_use_json_mode: bool = False
+    strata_enable_thinking: bool = False
 
     # External book metadata
     google_books_api_key: str = ""
