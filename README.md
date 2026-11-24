@@ -6,6 +6,7 @@ Aplicación web móvil-first (PWA) autoalojada para fotografiar tus estanterías
 
 - `backend/` — API REST en **FastAPI** + base de datos local **SQLite** (`data/library.db`).
 - `frontend/` — Interfaz **React + Vite + TypeScript + Tailwind CSS (PWA)**.
+- `docs/ARCHITECTURE.md` — Documentación técnica completa (arquitectura, modelo de datos, lógica de negocio y API).
 - `data/` — Base de datos y fotos de baldas escaneadas (ignorado en Git).
 
 ## Configuración inicial
